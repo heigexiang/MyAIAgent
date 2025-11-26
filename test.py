@@ -209,6 +209,7 @@ class ChatWindow:
         self.stream_live_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
         self._stream_thinking_buffer: List[str] = []
         self._stream_output_buffer: List[str] = []
+        self._stream_rendered_text: str = ""
 
         preview_frame = ttk.LabelFrame(self._scrollable_body, text="待发送 JSON 预览")
         preview_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
@@ -342,11 +343,52 @@ class ChatWindow:
             else "(暂无响应记录)",
         )
 
-    def _set_text(self, widget: scrolledtext.ScrolledText, value: str) -> None:
+    def _set_text(
+        self,
+        widget: scrolledtext.ScrolledText,
+        value: str,
+        keep_view: bool = False,
+        follow_tail: bool = False,
+    ) -> None:
+        previous_state = str(widget.cget("state"))
+        anchor_index = widget.index("@0,0") if keep_view else None
         widget.config(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         widget.insert(tk.END, value)
-        widget.config(state=tk.DISABLED)
+        if follow_tail:
+            widget.see(tk.END)
+        elif keep_view and anchor_index:
+            widget.see(anchor_index)
+        else:
+            widget.yview_moveto(0.0)
+        widget.config(state=previous_state)
+
+    def _insert_text(
+        self,
+        widget: scrolledtext.ScrolledText,
+        value: str,
+        follow_tail: bool = False,
+    ) -> None:
+        if not value:
+            return
+        previous_state = str(widget.cget("state"))
+        anchor_index = widget.index("@0,0")
+        widget.config(state=tk.NORMAL)
+        widget.insert(tk.END, value)
+        if follow_tail:
+            widget.see(tk.END)
+        else:
+            widget.see(anchor_index)
+        widget.config(state=previous_state)
+
+    def _is_widget_near_bottom(self, widget: scrolledtext.ScrolledText, threshold: float = 0.985) -> bool:
+        if not widget:
+            return False
+        try:
+            _first, last = widget.yview()
+        except tk.TclError:
+            return False
+        return last >= threshold
 
     def clear_memory(self) -> None:
         if not messagebox.askyesno("清空记忆", "将同时清空对话与持久化记忆，确定继续吗？"):
@@ -489,15 +531,19 @@ class ChatWindow:
     def _reset_stream_display(self) -> None:
         self._stream_thinking_buffer.clear()
         self._stream_output_buffer.clear()
+        self._stream_rendered_text = ""
         placeholder = "(启用流式响应以查看实时内容)"
         if not hasattr(self, "stream_live_box"):
             return
         if not self.streaming_var.get():
             self.streaming_status_var.set("状态: 流式未启用")
             self._set_text(self.stream_live_box, placeholder)
+            self._stream_rendered_text = placeholder
             return
         self.streaming_status_var.set("状态: 等待流式响应...")
-        self._set_text(self.stream_live_box, "(等待流式内容...)")
+        waiting = "(等待流式内容...)"
+        self._set_text(self.stream_live_box, waiting)
+        self._stream_rendered_text = waiting
 
     def _handle_stream_event(self, event: Dict[str, Any]) -> None:
         if not event or not self.streaming_var.get():
@@ -527,10 +573,14 @@ class ChatWindow:
         if not hasattr(self, "stream_live_box"):
             return
         if not self.streaming_var.get():
-            self._set_text(self.stream_live_box, "(启用流式响应以查看实时内容)")
+            placeholder = "(启用流式响应以查看实时内容)"
+            self._set_text(self.stream_live_box, placeholder)
+            self._stream_rendered_text = placeholder
             return
         if not (self._stream_thinking_buffer or self._stream_output_buffer):
-            self._set_text(self.stream_live_box, "(等待流式内容...)")
+            waiting = "(等待流式内容...)"
+            self._set_text(self.stream_live_box, waiting)
+            self._stream_rendered_text = waiting
             return
         sections: List[str] = []
         if self._stream_thinking_buffer:
@@ -538,7 +588,20 @@ class ChatWindow:
         if self._stream_output_buffer:
             sections.append("【输出】\n" + "".join(self._stream_output_buffer))
         text = "\n\n".join(sections)
-        self._set_text(self.stream_live_box, text)
+        at_bottom = self._is_widget_near_bottom(self.stream_live_box)
+        previous = self._stream_rendered_text
+        if text.startswith(previous):
+            delta = text[len(previous):]
+            if delta:
+                self._insert_text(self.stream_live_box, delta, follow_tail=at_bottom)
+        else:
+            self._set_text(
+                self.stream_live_box,
+                text,
+                keep_view=not at_bottom,
+                follow_tail=at_bottom,
+            )
+        self._stream_rendered_text = text
 
     def _set_reasoning(self, effort: str) -> None:
         try:

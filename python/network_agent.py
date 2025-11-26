@@ -590,15 +590,22 @@ class NetworkAgent:
         }
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             buffer: List[str] = []
+            current_event: Optional[str] = None
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
                     if buffer:
                         payload = "".join(buffer).strip()
                         buffer.clear()
-                        self._handle_stream_payload(payload, accumulator, callback)
+                        self._handle_stream_payload(payload, accumulator, callback, current_event)
+                        current_event = None
                     continue
                 if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    current_event = line[6:].strip() or None
+                    continue
+                if line.startswith("id:"):
                     continue
                 if line.startswith("data:"):
                     data_line = line[5:].lstrip()
@@ -609,7 +616,7 @@ class NetworkAgent:
                     buffer.append(line)
             if buffer:
                 payload = "".join(buffer).strip()
-                self._handle_stream_payload(payload, accumulator, callback)
+                self._handle_stream_payload(payload, accumulator, callback, current_event)
         final_resp = accumulator["final_response"]
         if final_resp is None:
             final_resp = {}
@@ -629,6 +636,7 @@ class NetworkAgent:
         payload: str,
         accumulator: Dict[str, Any],
         callback: Optional[Callable[[Dict[str, Any]], None]],
+        event_name: Optional[str] = None,
     ) -> None:
         if not payload:
             return
@@ -636,6 +644,8 @@ class NetworkAgent:
             chunk = json.loads(payload)
         except json.JSONDecodeError:
             return
+        if event_name and not chunk.get("type"):
+            chunk["type"] = event_name
         if callback:
             for event in self._chunk_to_events(chunk):
                 callback(event)

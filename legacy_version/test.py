@@ -1,8 +1,5 @@
 """Simple desktop chat window for the NetworkAgent.
 
-本文件现已连接到基于 OpenAI Python SDK 的 `python/network_agent.py`，
-旧实现（直接发 HTTP 请求版）已完整归档到 `legacy_version/test.py` 及其同目录下的模块。
-
 提供以下功能：
 - 聊天记录展示（用户与助手分色）
 - 输入框与发送按钮
@@ -213,7 +210,6 @@ class ChatWindow:
         self._stream_thinking_buffer: List[str] = []
         self._stream_output_buffer: List[str] = []
         self._stream_rendered_text: str = ""
-        self._stream_force_refresh = False
 
         preview_frame = ttk.LabelFrame(self._scrollable_body, text="待发送 JSON 预览")
         preview_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
@@ -536,7 +532,6 @@ class ChatWindow:
         self._stream_thinking_buffer.clear()
         self._stream_output_buffer.clear()
         self._stream_rendered_text = ""
-        self._stream_force_refresh = False
         placeholder = "(启用流式响应以查看实时内容)"
         if not hasattr(self, "stream_live_box"):
             return
@@ -572,12 +567,6 @@ class ChatWindow:
             self.streaming_status_var.set(f"状态: {status}")
         elif etype == "complete":
             self.streaming_status_var.set("状态: 完成")
-        elif etype == "final_text":
-            text = event.get("text") or ""
-            self._stream_thinking_buffer.clear()
-            self._stream_output_buffer = [text] if text else []
-            self._stream_rendered_text = ""
-            self._stream_force_refresh = True
         self._update_stream_box()
 
     def _update_stream_box(self) -> None:
@@ -601,15 +590,7 @@ class ChatWindow:
         text = "\n\n".join(sections)
         at_bottom = self._is_widget_near_bottom(self.stream_live_box)
         previous = self._stream_rendered_text
-        if getattr(self, "_stream_force_refresh", False):
-            self._set_text(
-                self.stream_live_box,
-                text,
-                keep_view=not at_bottom,
-                follow_tail=at_bottom,
-            )
-            self._stream_force_refresh = False
-        elif text.startswith(previous):
+        if text.startswith(previous):
             delta = text[len(previous):]
             if delta:
                 self._insert_text(self.stream_live_box, delta, follow_tail=at_bottom)

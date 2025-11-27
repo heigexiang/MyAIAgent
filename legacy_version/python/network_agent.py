@@ -25,24 +25,24 @@ import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Match, Optional, Sequence, Tuple, Union
-
-from openai import OpenAI
+from typing import Any, Callable, Dict, Iterable, List, Match, Optional, Sequence, Tuple
 
 from python.agent_memory import AgentMemory
 from python.image_preprocessor import is_image_file, preprocess_image
 
 MODEL_PROFILES = {
     "gpt-4.1": {
-        "endpoint": "https://aihubmix.com/v1",
+        "endpoint": "https://aihubmix.com/v1/responses",
         "schema": "responses",
         "supports_temperature": True,
         "supports_reasoning": False,
         "supports_web_search": False,
     },
     "gpt-5": {
-        "endpoint": "https://aihubmix.com/v1",
+        "endpoint": "https://aihubmix.com/v1/responses",
         "schema": "responses",
         "supports_temperature": False,
         "supports_reasoning": True,
@@ -141,8 +141,6 @@ class NetworkAgent:
         self.memory = self._init_memory(memory_manager, memory_storage_path, memory_max_entries)
         self._load_history_into_conversation()
         self._bootstrap_memory_history()
-        self._client: Optional[OpenAI] = None
-        self._client_endpoint: Optional[str] = None
 
     # ------------------------------------------------------------------
     def set_reasoning_effort(self, effort: Optional[str]) -> None:
@@ -262,9 +260,9 @@ class NetworkAgent:
             if profile.get("supports_web_search") and self.web_search_enabled:
                 request_timeout = max(request_timeout, WEB_SEARCH_MIN_TIMEOUT)
             use_stream = self.streaming_enabled and profile.get("schema") == "responses"
-            raw = self._dispatch_via_sdk(
+            raw = self._post_json(
                 payload,
-                profile.get("endpoint") or self.endpoint,
+                profile["endpoint"],
                 timeout=request_timeout,
                 stream=use_stream,
                 stream_callback=stream_callback,
@@ -278,11 +276,6 @@ class NetworkAgent:
             user_snapshot = self._content_to_text(user_content)
             self.memory.add_interaction(user_snapshot, reply)
         self._save_history()
-        if self.streaming_enabled and stream_callback:
-            try:
-                stream_callback({"type": "final_text", "text": reply})
-            except Exception:
-                pass
         operations = parse_operations(reply)
         return reply, operations
 
@@ -378,7 +371,9 @@ class NetworkAgent:
         if profile.get("supports_reasoning") and reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
         if profile.get("supports_web_search") and self.web_search_enabled:
-            payload["tools"] = [{"type": "web_search"}]
+            payload["tools"] = [{"type": "web_search_preview"}]
+        if self.streaming_enabled and schema == "responses":
+            payload["stream"] = True
         return payload
 
     def _resolve_reasoning_effort(self) -> Optional[str]:
@@ -492,7 +487,7 @@ class NetworkAgent:
         return "[附件]"
 
     def _create_stream_normalizer(self) -> Optional["WebSearchStreamNormalizer"]:
-        if not self.streaming_enabled:
+        if not (self.streaming_enabled and self.web_search_enabled):
             return None
         return WebSearchStreamNormalizer()
 
@@ -626,58 +621,58 @@ class NetworkAgent:
         if len(self.conversation) > cap:
             self.conversation = self.conversation[-cap:]
 
-    def _dispatch_via_sdk(
+    def _post_json(
         self,
         body: Dict[str, Any],
-        endpoint: Optional[str],
+        endpoint: str,
         *,
-        timeout: Optional[float],
-        stream: bool,
+        timeout: Optional[float] = None,
+        stream: bool = False,
         stream_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         if not self.api_key:
             raise RuntimeError("未配置 API Key。请设置 MODEL_API_KEY 环境变量或在构造函数传入 api_key。")
-        client = self._ensure_client(endpoint)
-        payload = dict(body)
+        data = json.dumps(body).encode("utf-8")
         headers = self._build_headers()
-        target = (endpoint or self.endpoint or "").rstrip("/")
-        request_record = {
-            "endpoint": target,
-            "headers": mask_headers(headers),
-            "body": body,
-        }
-        self.last_preview["request"] = request_record
+        target = endpoint or self.endpoint
+        request = urllib.request.Request(target, data=data, headers=headers)
         start = time.time()
         effective_timeout = timeout if timeout is not None else self.timeout
         try:
             if stream:
-                payload["stream"] = True
-                result, raw_result = self._stream_via_sdk(
-                    client,
-                    payload,
+                result = self._post_streaming_request(
+                    request,
                     timeout=effective_timeout,
                     callback=stream_callback,
                 )
             else:
-                payload.pop("stream", None)
-                response = client.responses.create(timeout=effective_timeout, **payload)
-                result = self._response_to_dict(response)
-                raw_result = result
+                with urllib.request.urlopen(request, timeout=effective_timeout) as resp:
+                    resp_bytes = resp.read()
+                    text = resp_bytes.decode("utf-8", errors="replace")
+                    result = json.loads(text)
+        except urllib.error.HTTPError as err:
+            payload = err.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {err.code}: {payload}") from err
+        except urllib.error.URLError as err:
+            raise RuntimeError(f"请求失败: {err.reason}") from err
         finally:
-            request_record["elapsed"] = time.time() - start
-        self.last_preview["response"] = raw_result
+            elapsed = time.time() - start
+            self.last_preview["request"] = {
+                "endpoint": target,
+                "headers": mask_headers(headers),
+                "body": body,
+                "elapsed": elapsed,
+            }
+        self.last_preview["response"] = result
         return result
 
-    def _stream_via_sdk(
+    def _post_streaming_request(
         self,
-        client: OpenAI,
-        body: Dict[str, Any],
+        request: urllib.request.Request,
         *,
         timeout: float,
         callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        request_body = dict(body)
-        request_body.pop("stream", None)
+    ) -> Dict[str, Any]:
         accumulator = {
             "text_parts": [],
             "output_items": [],
@@ -685,103 +680,68 @@ class NetworkAgent:
             "usage": None,
         }
         normalizer = self._create_stream_normalizer()
-        final_response_obj: Optional[Any] = None
-        with client.responses.stream(timeout=timeout, **request_body) as stream:
-            for event in stream:
-                chunk = self._event_to_dict(event)
-                if not chunk:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            buffer: List[str] = []
+            current_event: Optional[str] = None
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    if buffer:
+                        payload = "".join(buffer).strip()
+                        buffer.clear()
+                        self._handle_stream_payload(
+                            payload,
+                            accumulator,
+                            callback,
+                            current_event,
+                            normalizer,
+                        )
+                        current_event = None
                     continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    current_event = line[6:].strip() or None
+                    continue
+                if line.startswith("id:"):
+                    continue
+                if line.startswith("data:"):
+                    data_line = line[5:].lstrip()
+                    if data_line == "[DONE]":
+                        break
+                    buffer.append(data_line)
+                else:
+                    buffer.append(line)
+            if buffer:
+                payload = "".join(buffer).strip()
                 self._handle_stream_payload(
-                    chunk,
+                    payload,
                     accumulator,
                     callback,
-                    None,
+                    current_event,
                     normalizer,
                 )
-            final_response_obj = stream.get_final_response()
         if normalizer and callback:
             for text in normalizer.flush():
                 if text:
                     callback({"type": "text", "text": text})
-        raw_result = self._finalize_stream_result(accumulator)
-        clean_result = (
-            self._response_to_dict(final_response_obj)
-            if final_response_obj is not None
-            else raw_result
-        )
-        return clean_result, raw_result
-
-    def _response_to_dict(self, response: Any) -> Dict[str, Any]:
-        if response is None:
-            return {}
-        if isinstance(response, dict):
-            return response
-        if hasattr(response, "model_dump"):
-            return response.model_dump()
-        if hasattr(response, "to_dict"):
-            return response.to_dict()
-        if hasattr(response, "__dict__"):
-            raw = {k: v for k, v in response.__dict__.items() if not k.startswith("_")}
-            if raw:
-                return raw
-        return json.loads(json.dumps(response, default=str))
-
-    def _event_to_dict(self, event: Any) -> Dict[str, Any]:
-        if event is None:
-            return {}
-        if isinstance(event, dict):
-            return event
-        if hasattr(event, "model_dump"):
-            return event.model_dump()
-        if hasattr(event, "to_dict"):
-            return event.to_dict()
-        data: Dict[str, Any] = {}
-        event_type = getattr(event, "type", None)
-        if event_type:
-            data["type"] = event_type
-        payload = getattr(event, "data", None)
-        if isinstance(payload, dict):
-            data.update(payload)
-        elif payload is not None:
-            data["data"] = payload
-        if not data and hasattr(event, "__dict__"):
-            data = {k: v for k, v in event.__dict__.items() if not k.startswith("_")}
-        return data
-
-    def _ensure_client(self, endpoint: Optional[str] = None) -> OpenAI:
-        target = (endpoint or self.endpoint or DEFAULT_ENDPOINT).rstrip("/")
-        if target.endswith("/responses"):
-            target = target[: -len("/responses")]
-        if not self._client or self._client_endpoint != target:
-            self.endpoint = target
-            self._client = self._create_client(base_url=target)
-            self._client_endpoint = target
-        return self._client
-
-    def _create_client(self, *, base_url: Optional[str] = None) -> OpenAI:
-        client_kwargs: Dict[str, Any] = {}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        if self.api_key:
-            client_kwargs["api_key"] = self.api_key
-        custom_headers = self._custom_sdk_headers()
-        if custom_headers:
-            client_kwargs["default_headers"] = custom_headers
-        return OpenAI(**client_kwargs)
-
-    def _custom_sdk_headers(self) -> Dict[str, str]:
-        if not self.api_key:
-            return {}
-        auth = (self.auth_type or "bearer").lower()
-        if auth == "bearer":
-            return {}
-        if auth == "x-api-key":
-            return {"X-API-Key": self.api_key}
-        return {self.auth_type: self.api_key}
+        final_resp = accumulator["final_response"]
+        if final_resp is None:
+            final_resp = {}
+        text_value = "".join(accumulator["text_parts"])
+        if text_value and not final_resp.get("output_text"):
+            final_resp["output_text"] = [text_value]
+        if accumulator["output_items"] and not final_resp.get("output"):
+            final_resp["output"] = accumulator["output_items"]
+        if accumulator["usage"] and not final_resp.get("usage"):
+            final_resp["usage"] = accumulator["usage"]
+        if text_value and not final_resp.get("text"):
+            final_resp["text"] = text_value
+        return final_resp
 
     def _handle_stream_payload(
         self,
-        payload: Union[str, Dict[str, Any]],
+        payload: str,
         accumulator: Dict[str, Any],
         callback: Optional[Callable[[Dict[str, Any]], None]],
         event_name: Optional[str] = None,
@@ -789,13 +749,10 @@ class NetworkAgent:
     ) -> None:
         if not payload:
             return
-        if isinstance(payload, dict):
-            chunk = payload
-        else:
-            try:
-                chunk = json.loads(payload)
-            except json.JSONDecodeError:
-                return
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            return
         if event_name and not chunk.get("type"):
             chunk["type"] = event_name
         if normalizer:
@@ -874,32 +831,13 @@ class NetworkAgent:
             message = chunk.get("error", {}).get("message") or chunk.get("message") or "流式响应失败"
             raise RuntimeError(message)
 
-    def _finalize_stream_result(self, accumulator: Dict[str, Any]) -> Dict[str, Any]:
-        base = accumulator.get("final_response")
-        result = self._response_to_dict(base) if base is not None else {}
-        if not isinstance(result, dict):
-            result = {}
-        text_value = "".join(accumulator.get("text_parts", []))
-        if text_value and not result.get("output_text"):
-            result["output_text"] = [text_value]
-        output_items = accumulator.get("output_items") or []
-        if output_items and not result.get("output"):
-            result["output"] = output_items
-        usage_value = accumulator.get("usage")
-        if usage_value and not result.get("usage"):
-            result["usage"] = usage_value
-        if text_value and not result.get("text"):
-            result["text"] = text_value
-        return result
-
     def _build_headers(self) -> Dict[str, str]:
-        headers: Dict[str, str] = {}
+        headers = {"Content-Type": "application/json"}
         if not self.api_key:
             return headers
-        auth = (self.auth_type or "bearer").lower()
-        if auth == "bearer":
+        if self.auth_type.lower() == "bearer":
             headers["Authorization"] = f"Bearer {self.api_key}"
-        elif auth == "x-api-key":
+        elif self.auth_type.lower() == "x-api-key":
             headers["X-API-Key"] = self.api_key
         else:
             headers[self.auth_type] = self.api_key

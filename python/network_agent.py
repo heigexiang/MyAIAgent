@@ -98,7 +98,10 @@ DEFAULT_MODEL = "gpt-4.1"
 DEFAULT_ENDPOINT = MODEL_PROFILES[DEFAULT_MODEL]["endpoint"]
 DEFAULT_SYSTEM_PROMPT = (
     "你运行在 Cherry Studio 中。若用户请求创建/修改/生成文件，请仅在回答末尾输出一行标记 ###OPERATIONS "
-    "后跟一个 JSON 数组，数组元素格式 {\"action\":\"writeFile\",\"path\":\"相对路径\",\"content\":\"文件内容\"}。"
+    "后跟一个 JSON 数组，数组元素格式 {\"action\":\"writeFile\",\"path\":\"相对路径\",\"content\":\"文件内容\"}，"
+    "必要时可额外附加 \"diff\" 字段放置 unified diff 预览。"
+    "若需要读取工作区文件，请在 ###OPERATIONS 中追加 {\"action\":\"readFile\",\"path\":\"相对路径\"}，"
+    "并等待后续响应提供文件内容，切勿臆造文件文本。"
     "其它解释放在前面。若无文件操作则不要输出 ###OPERATIONS。禁止在 JSON 中出现注释。"
 )
 

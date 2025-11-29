@@ -29,6 +29,7 @@ from PIL import Image, ImageTk
 
 from python.image_preprocessor import is_image_file, preprocess_image
 from python.network_agent import NetworkAgent
+from python.file_ops import build_unified_diff, read_text_for_diff
 
 with open('api-key.txt', 'r', encoding='utf-8') as f:
     api_key = f.read().strip()
@@ -56,6 +57,8 @@ REASONING_CHOICES = [
 
 class ChatWindow:
     def __init__(self) -> None:
+        self.workspace_root = Path(__file__).resolve().parent
+        self._workspace_root_resolved = self.workspace_root.resolve()
         self.agent = NetworkAgent(api_key=api_key)
         self.root = tk.Tk()
         self.root.title("Cherry Studio Python Chat")
@@ -197,6 +200,31 @@ class ChatWindow:
         )
         self.attachment_info_label.pack(fill=tk.X, expand=False, pady=(6, 0))
 
+        ops_frame = ttk.LabelFrame(self._scrollable_body, text="生成的文件操作")
+        ops_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
+        self.operations_box = scrolledtext.ScrolledText(ops_frame, height=8, wrap=tk.NONE, state=tk.DISABLED)
+        self.operations_box.pack(fill=tk.BOTH, expand=True)
+        self.apply_operations_button = tk.Button(
+            ops_frame,
+            text="应用操作到磁盘",
+            command=self.apply_pending_operations,
+            state=tk.DISABLED,
+        )
+        self.apply_operations_button.pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        read_frame = ttk.LabelFrame(self._scrollable_body, text="读取文件")
+        read_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
+        read_controls = tk.Frame(read_frame)
+        read_controls.pack(fill=tk.X, padx=4, pady=(2, 2))
+        tk.Label(read_controls, text="相对路径:").pack(side=tk.LEFT)
+        self.read_path_var = tk.StringVar()
+        self.read_path_entry = tk.Entry(read_controls, textvariable=self.read_path_var)
+        self.read_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        tk.Button(read_controls, text="浏览", command=self.browse_read_file).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(read_controls, text="读取", command=self.read_file_content).pack(side=tk.LEFT)
+        self.read_output_box = scrolledtext.ScrolledText(read_frame, height=8, wrap=tk.NONE, state=tk.DISABLED)
+        self.read_output_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
         stream_frame = ttk.LabelFrame(self._scrollable_body, text="实时流式状态")
         stream_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
         self.streaming_status_var = tk.StringVar(value="状态: 流式未启用")
@@ -214,6 +242,10 @@ class ChatWindow:
         self._stream_output_buffer: List[str] = []
         self._stream_rendered_text: str = ""
         self._stream_force_refresh = False
+        self._pending_operations: List[Dict[str, Any]] = []
+        self._auto_read_active = False
+        self._auto_read_counter = 0
+        self._auto_read_limit = 5
 
         preview_frame = ttk.LabelFrame(self._scrollable_body, text="待发送 JSON 预览")
         preview_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
@@ -238,6 +270,8 @@ class ChatWindow:
 
         self._set_text(self.request_preview, "(输入内容以生成预览)")
         self._set_text(self.response_preview, "(暂无响应记录)")
+        self._set_text(self.operations_box, "(暂无文件操作)")
+        self._set_text(self.read_output_box, "(尚未读取任何文件)")
         self.restore_conversation_history()
         self.update_memory_label()
         self._reset_stream_display()
@@ -265,6 +299,7 @@ class ChatWindow:
         self._cancel_preview_job()
         self._set_text(self.request_preview, "(等待下一次输入以生成预览)")
         self._reset_stream_display()
+        self._auto_read_counter = 0
         stream_callback = self._handle_stream_event if self.streaming_var.get() else None
         threading.Thread(
             target=self._worker_send,
@@ -280,7 +315,7 @@ class ChatWindow:
         stream_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         try:
-            reply, _ops = self.agent.send_message(
+            reply, ops = self.agent.send_message(
                 text,
                 attachments=attachments,
                 stream_callback=stream_callback,
@@ -289,20 +324,41 @@ class ChatWindow:
         except Exception as exc:  # noqa: BLE001 - 展示真实错误
             reply = "(请求失败: {} )".format(exc)
             error = exc
-        self.root.after(0, self._on_response, reply, error)
+        self.root.after(0, self._on_response, reply, error, ops if error is None else [])
 
-    def _on_response(self, reply: str, error: Exception | None) -> None:
-        self.stop_spinner()
-        self.send_button.config(state=tk.NORMAL)
+    def _on_response(self, reply: str, error: Exception | None, operations: List[Dict[str, Any]]) -> None:
+        self._process_agent_response(reply, error, operations, suppress_spinner=False, update_stream=True)
+
+    def _process_agent_response(
+        self,
+        reply: str,
+        error: Exception | None,
+        operations: List[Dict[str, Any]],
+        *,
+        suppress_spinner: bool,
+        update_stream: bool,
+    ) -> None:
+        if not suppress_spinner:
+            self.stop_spinner()
+            self.send_button.config(state=tk.NORMAL)
         if error:
             messagebox.showerror("调用失败", str(error))
-            if self.streaming_var.get():
+            if self.streaming_var.get() and update_stream:
                 self.streaming_status_var.set("状态: 调用失败")
                 if not (self._stream_output_buffer or self._stream_thinking_buffer):
                     self._set_text(self.stream_live_box, f"(错误详情) {error}")
-        elif self.streaming_var.get():
-            self.streaming_status_var.set("状态: 完成")
-            self._update_stream_box()
+            self._pending_operations = []
+            self._update_operations_preview([])
+        else:
+            if self.streaming_var.get() and update_stream:
+                self.streaming_status_var.set("状态: 完成")
+                self._update_stream_box()
+            write_ops = [op for op in operations or [] if (op.get("action") == "writeFile")]
+            read_ops = [op for op in operations or [] if (op.get("action") == "readFile")]
+            self._pending_operations = write_ops
+            self._update_operations_preview(self._pending_operations)
+            if read_ops:
+                self._handle_read_operations(read_ops)
         self.append_history("assistant", reply)
         self.refresh_response_preview()
         self.schedule_request_preview()
@@ -621,6 +677,206 @@ class ChatWindow:
                 follow_tail=at_bottom,
             )
         self._stream_rendered_text = text
+
+    def _update_operations_preview(self, operations: List[Dict[str, Any]]) -> None:
+        if not hasattr(self, "operations_box"):
+            return
+        if not operations:
+            self._set_text(self.operations_box, "(暂无文件操作)")
+            if hasattr(self, "apply_operations_button"):
+                self.apply_operations_button.config(state=tk.DISABLED)
+            return
+        if hasattr(self, "apply_operations_button"):
+            self.apply_operations_button.config(state=tk.NORMAL)
+        lines: List[str] = []
+        for idx, op in enumerate(operations, start=1):
+            action = op.get("action") or "(未知操作)"
+            rel_path = op.get("path") or "(缺少路径)"
+            lines.append(f"{idx}. {action} -> {rel_path}")
+            if action == "writeFile":
+                content = op.get("content")
+                if isinstance(content, str):
+                    diff = self._build_operation_diff(rel_path, content)
+                    lines.append(diff if diff else "   (无法生成 diff)")
+                else:
+                    lines.append("   (无内容，无法显示 diff)")
+            else:
+                lines.append("   (暂不支持预览该操作)")
+        self._set_text(self.operations_box, "\n".join(lines))
+
+    def _build_operation_diff(self, rel_path: str, new_content: str) -> str:
+        target = (self.workspace_root / rel_path).resolve()
+        try:
+            original = read_text_for_diff(target)
+        except Exception as exc:  # noqa: BLE001 - 仅用于预览
+            return f"   (读取原文件失败: {exc})"
+        diff = build_unified_diff(rel_path, original, new_content)
+        if not diff:
+            return "   (内容未变化)"
+        return "   Diff:\n" + "\n".join(f"   {line}" for line in diff.splitlines())
+
+    def _handle_read_operations(self, operations: List[Dict[str, Any]]) -> None:
+        if self._auto_read_active:
+            return
+        if self._auto_read_counter >= self._auto_read_limit:
+            messagebox.showwarning("自动读取", "已达到自动读取上限，请手动提供文件内容。")
+            return
+        lines: List[str] = ["[自动读取] 以下是请求的文件内容:"]
+        attachments: List[str] = []
+        has_result = False
+        for op in operations:
+            rel_path = (op.get("path") or "").strip()
+            if not rel_path:
+                lines.append("- (缺少路径)")
+                continue
+            try:
+                target = self._resolve_workspace_path(rel_path)
+            except ValueError as exc:
+                lines.append(f"- {rel_path}: {exc}")
+                continue
+            if not target.exists():
+                lines.append(f"- {rel_path}: 文件不存在")
+                continue
+            size = target.stat().st_size
+            lines.append(f"- {rel_path}: 已附加 ({size} bytes)")
+            attachments.append(target.as_posix())
+            has_result = True
+        summary_text = "\n".join(lines)
+        if not has_result and len(lines) == 1:
+            return
+        self.append_history("user", summary_text)
+        self._start_auto_read_request(summary_text, attachments)
+
+    def _start_auto_read_request(self, text: str, attachments: List[str]) -> None:
+        if self._auto_read_active:
+            return
+        self._auto_read_active = True
+        self._auto_read_counter += 1
+        stream_callback = None
+        if self.streaming_var.get():
+            stream_callback = self._handle_stream_event
+            self._reset_stream_display()
+            self.streaming_status_var.set("状态: 自动读取中...")
+        threading.Thread(
+            target=self._worker_auto_read,
+            args=(text, attachments, stream_callback),
+            daemon=True,
+        ).start()
+
+    def _worker_auto_read(
+        self,
+        text: str,
+        attachments: List[str],
+        stream_callback: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> None:
+        try:
+            reply, ops = self.agent.send_message(
+                text,
+                attachments=attachments,
+                stream_callback=stream_callback,
+            )
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            reply = f"(自动读取失败: {exc})"
+            error = exc
+            ops = []
+        self.root.after(0, self._on_auto_read_response, reply, error, ops)
+
+    def _on_auto_read_response(self, reply: str, error: Exception | None, operations: List[Dict[str, Any]]) -> None:
+        self._auto_read_active = False
+        self._process_agent_response(
+            reply,
+            error,
+            operations,
+            suppress_spinner=True,
+            update_stream=self.streaming_var.get(),
+        )
+
+    def browse_read_file(self) -> None:
+        initial = str(self._workspace_root_resolved)
+        path = filedialog.askopenfilename(title="选择要读取的文件", initialdir=initial)
+        if not path:
+            return
+        try:
+            rel = os.path.relpath(path, start=initial)
+        except ValueError:
+            messagebox.showerror("读取文件", "所选文件不在工作目录内。")
+            return
+        self.read_path_var.set(rel.replace("\\", "/"))
+        self.read_file_content()
+
+    def read_file_content(self) -> None:
+        rel = (self.read_path_var.get() or "").strip()
+        if not rel:
+            messagebox.showinfo("读取文件", "请输入相对路径或使用浏览按钮选择文件。")
+            return
+        try:
+            target = self._resolve_workspace_path(rel)
+        except ValueError as exc:
+            messagebox.showerror("读取文件", str(exc))
+            return
+        if not target.exists():
+            self._set_text(self.read_output_box, f"(文件不存在: {rel})")
+            return
+        try:
+            content = read_text_for_diff(target)
+        except Exception as exc:  # noqa: BLE001 - 反馈给用户
+            self._set_text(self.read_output_box, f"(读取失败: {exc})")
+            return
+        if content is None:
+            self._set_text(self.read_output_box, "(该文件无法作为文本读取)")
+            return
+        limit = 20000
+        display = content if len(content) <= limit else content[:limit] + "\n...(已截断)"
+        header = f"路径: {rel}\n大小: {target.stat().st_size} bytes\n---\n"
+        self._set_text(self.read_output_box, header + display, follow_tail=False)
+
+    def apply_pending_operations(self) -> None:
+        if not self._pending_operations:
+            messagebox.showinfo("应用操作", "当前没有可应用的文件操作。")
+            return
+        applied: List[str] = []
+        failed: List[str] = []
+        remaining: List[Dict[str, Any]] = []
+        for op in self._pending_operations:
+            action = op.get("action")
+            rel_path = op.get("path")
+            if action != "writeFile" or not rel_path:
+                failed.append(f"不支持的操作: {action or '未知'}")
+                remaining.append(op)
+                continue
+            try:
+                target = self._resolve_workspace_path(rel_path)
+            except ValueError as exc:
+                failed.append(f"{rel_path}: {exc}")
+                remaining.append(op)
+                continue
+            content = op.get("content")
+            if not isinstance(content, str):
+                failed.append(f"{rel_path}: 缺少文本内容")
+                remaining.append(op)
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                applied.append(rel_path)
+            except Exception as exc:  # noqa: BLE001 - 展示给用户
+                failed.append(f"{rel_path}: {exc}")
+                remaining.append(op)
+        self._pending_operations = remaining
+        self._update_operations_preview(self._pending_operations)
+        if applied:
+            message = "\n".join(applied)
+            messagebox.showinfo("应用操作成功", f"已写入 {len(applied)} 个文件:\n{message}")
+        if failed:
+            detail = "\n".join(failed)
+            messagebox.showerror("部分操作失败", detail)
+
+    def _resolve_workspace_path(self, rel_path: str) -> Path:
+        candidate = (self.workspace_root / rel_path).resolve()
+        if not str(candidate).startswith(str(self._workspace_root_resolved)):
+            raise ValueError("路径超出工作目录范围")
+        return candidate
 
     def _set_reasoning(self, effort: str) -> None:
         try:

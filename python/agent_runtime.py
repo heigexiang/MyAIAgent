@@ -26,7 +26,18 @@ from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, Dict, List, Optional
 
+from python.file_ops import build_unified_diff, read_text_for_diff
+
 AGENT_SCRIPT = Path(__file__).resolve().parent / "agent.py"
+
+
+@dataclass
+class FileOperationResult:
+    path: Path
+    action: str
+    applied: bool
+    diff: Optional[str] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -37,24 +48,32 @@ class AgentResponse:
     operations: List[Dict[str, Any]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
 
-    def apply_operations(self, workspace_root: Path) -> List[Path]:
-        """Apply writeFile operations to the given workspace_root.
+    def apply_operations(self, workspace_root: Path) -> List[FileOperationResult]:
+        """Apply write operations to the given workspace_root.
 
-        Returns the list of files written.
+        Returns the list of operation results including patch previews.
         """
-        written: List[Path] = []
+        results: List[FileOperationResult] = []
         for op in self.operations:
-            if op.get("action") != "writeFile":
+            action = op.get("action")
+            if action != "writeFile":
                 continue
             rel = op.get("path")
             content = op.get("content", "")
             if not rel:
                 continue
             target = workspace_root / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            written.append(target)
-        return written
+            result = FileOperationResult(path=target, action=action, applied=False)
+            original = read_text_for_diff(target)
+            result.diff = build_unified_diff(rel, original, content or "")
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                result.applied = True
+            except Exception as exc:
+                result.error = str(exc)
+            results.append(result)
+        return results
 
 
 class AgentRuntime:
@@ -160,13 +179,14 @@ def demo() -> None:
     try:
         for prompt in ["列目录", "创建示例", "读取 examples/hello.txt"]:
             resp = agent.send_chat(prompt)
-            written = resp.apply_operations(agent.workspace_root)
+            results = resp.apply_operations(agent.workspace_root)
             print("PROMPT:", prompt)
             print("TEXT:", resp.text)
-            if written:
-                print("FILES WRITTEN:")
-                for path in written:
-                    print(" -", path)
+            if results:
+                print("OPERATIONS:")
+                for result in results:
+                    status = "ok" if result.applied and not result.error else f"error: {result.error}"
+                    print(f" - {result.action} -> {result.path} ({status})")
             print("---")
     finally:
         agent.stop()

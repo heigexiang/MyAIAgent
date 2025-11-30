@@ -100,6 +100,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "你运行在 Cherry Studio 中。若用户请求创建/修改/生成文件，请仅在回答末尾输出一行标记 ###OPERATIONS "
     "后跟一个 JSON 数组，数组元素格式 {\"action\":\"writeFile\",\"path\":\"相对路径\",\"content\":\"文件内容\"}，"
     "必要时可额外附加 \"diff\" 字段放置 unified diff 预览。"
+    "所有 JSON 字符串必须完全合法（相当于经过 json.dumps 处理），"
+    "尤其要把内容中的反斜杠写成 \\\\、双引号写成 \\\"。"
     "若需要读取工作区文件，请在 ###OPERATIONS 中追加 {\"action\":\"readFile\",\"path\":\"相对路径\"}，"
     "并等待后续响应提供文件内容，切勿臆造文件文本。"
     "其它解释放在前面。若无文件操作则不要输出 ###OPERATIONS。禁止在 JSON 中出现注释。"
@@ -259,6 +261,11 @@ class NetworkAgent:
         self.conversation.append({"role": "user", "content": user_content})
         self._prune_history()
         profile = self._get_model_profile()
+        stream_filter: Optional["StreamOperationsFilter"] = None
+        wrapped_stream_callback = stream_callback
+        if stream_callback and self.streaming_enabled:
+            stream_filter = StreamOperationsFilter()
+            wrapped_stream_callback = self._wrap_stream_callback(stream_callback, stream_filter)
         try:
             payload = self._build_payload(profile, temperature)
             request_timeout = self.timeout
@@ -270,24 +277,31 @@ class NetworkAgent:
                 profile.get("endpoint") or self.endpoint,
                 timeout=request_timeout,
                 stream=use_stream,
-                stream_callback=stream_callback,
+                stream_callback=wrapped_stream_callback,
             )
             reply = self._extract_reply(raw, profile)
         except Exception:
             self._save_history()
             raise
-        self.conversation.append({"role": "assistant", "content": reply})
+        display_reply, operations = extract_display_text_and_operations(reply)
+        assistant_entry: Dict[str, Any] = {"role": "assistant", "content": display_reply}
+        if operations:
+            assistant_entry["operations"] = operations
+        self.conversation.append(assistant_entry)
         if self.memory is not None:
             user_snapshot = self._content_to_text(user_content)
-            self.memory.add_interaction(user_snapshot, reply)
+            self.memory.add_interaction(user_snapshot, display_reply)
         self._save_history()
         if self.streaming_enabled and stream_callback:
+            if stream_filter:
+                for chunk in stream_filter.flush():
+                    if chunk:
+                        stream_callback({"type": "text", "text": chunk})
             try:
-                stream_callback({"type": "final_text", "text": reply})
+                stream_callback({"type": "final_text", "text": display_reply})
             except Exception:
                 pass
-        operations = parse_operations(reply)
-        return reply, operations
+        return display_reply, operations
 
     # ------------------------------------------------------------------
     def build_request_preview(
@@ -670,6 +684,24 @@ class NetworkAgent:
             request_record["elapsed"] = time.time() - start
         self.last_preview["response"] = raw_result
         return result
+
+    def _wrap_stream_callback(
+        self,
+        callback: Callable[[Dict[str, Any]], None],
+        filter_obj: "StreamOperationsFilter",
+    ) -> Callable[[Dict[str, Any]], None]:
+        def wrapped(event: Dict[str, Any]) -> None:
+            if not event:
+                return
+            if event.get("type") == "text":
+                text = event.get("text") or ""
+                for chunk in filter_obj.feed(text):
+                    if chunk:
+                        callback({"type": "text", "text": chunk})
+                return
+            callback(event)
+
+        return wrapped
 
     def _stream_via_sdk(
         self,
@@ -1208,11 +1240,12 @@ class WebSearchStreamNormalizer:
         return "\n".join(lines) + "\n"
 
 # ----------------------------------------------------------------------
-def parse_operations(text: str) -> List[Dict[str, Any]]:
+def _split_operations_block(text: str) -> Tuple[str, Optional[str]]:
     marker = "###OPERATIONS"
     idx = text.find(marker)
     if idx == -1:
-        return []
+        return text, None
+    prefix = text[:idx].rstrip()
     snippet = text[idx + len(marker):].strip()
     if snippet.startswith("```"):
         snippet = snippet[3:]
@@ -1220,15 +1253,136 @@ def parse_operations(text: str) -> List[Dict[str, Any]]:
         if fence_end != -1:
             snippet = snippet[:fence_end]
     snippet = snippet.lstrip("json").strip()
+    return prefix, snippet or None
+
+
+def _repair_invalid_escape_sequences(snippet: str) -> str:
+    """Insert missing backslashes for invalid JSON escape sequences inside strings."""
+
+    allowed = {'"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'}
+    result: List[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    length = len(snippet)
+    while i < length:
+        ch = snippet[i]
+        result.append(ch)
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif ch == '\\':
+            next_ch = snippet[i + 1] if i + 1 < length else ""
+            if in_string and (not next_ch or next_ch not in allowed):
+                result.append('\\')
+            elif not next_ch:
+                result.append('\\')
+            escape = True
+        i += 1
+    return "".join(result)
+
+
+def _decode_operations_snippet(snippet: Optional[str]) -> List[Dict[str, Any]]:
+    if not snippet:
+        return []
     try:
         data = json.loads(snippet)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and isinstance(data.get("operations"), list):
-            return data["operations"]
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        if "Invalid \\escape" in str(exc):
+            repaired = _repair_invalid_escape_sequences(snippet)
+            try:
+                data = json.loads(repaired)
+            except json.JSONDecodeError:
+                return []
+        else:
+            return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("operations"), list):
+        return data["operations"]
     return []
+
+
+def parse_operations(text: str) -> List[Dict[str, Any]]:
+    _, snippet = _split_operations_block(text)
+    return _decode_operations_snippet(snippet)
+
+
+def extract_display_text_and_operations(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    prefix, snippet = _split_operations_block(text)
+    operations = _decode_operations_snippet(snippet)
+    if snippet is None:
+        return text, operations
+    display = prefix.strip()
+    if not display:
+        display = _summarize_operations(operations)
+    return display or "(已执行文件操作)", operations
+
+
+def _summarize_operations(operations: List[Dict[str, Any]]) -> str:
+    if not operations:
+        return ""
+    writes = [op.get("path") for op in operations if op.get("action") == "writeFile" and op.get("path")]
+    reads = [op.get("path") for op in operations if op.get("action") == "readFile" and op.get("path")]
+    pieces: List[str] = []
+    if writes:
+        summary = ", ".join(writes[:3])
+        if len(writes) > 3:
+            summary += f" 等 {len(writes)} 个文件"
+        pieces.append(f"已写入: {summary}")
+    if reads:
+        summary = ", ".join(reads[:3])
+        if len(reads) > 3:
+            summary += f" 等 {len(reads)} 个读取请求"
+        pieces.append(f"已读取: {summary}")
+    return "；".join(pieces)
+
+
+class StreamOperationsFilter:
+    """Filter that removes the ###OPERATIONS JSON block from streaming text."""
+
+    MARKER = "###OPERATIONS"
+
+    def __init__(self) -> None:
+        self._buffer: str = ""
+        self._marker_seen = False
+        self._hold = max(1, len(self.MARKER) - 1)
+
+    def feed(self, delta: str) -> List[str]:
+        if not delta:
+            return []
+        if self._marker_seen:
+            return []
+        self._buffer += delta
+        outputs: List[str] = []
+        while not self._marker_seen:
+            idx = self._buffer.find(self.MARKER)
+            if idx == -1:
+                if len(self._buffer) <= self._hold:
+                    break
+                emit = self._buffer[:-self._hold]
+                self._buffer = self._buffer[-self._hold:]
+                outputs.append(emit)
+                break
+            emit = self._buffer[:idx]
+            if emit:
+                outputs.append(emit)
+            self._buffer = ""
+            self._marker_seen = True
+            break
+        return outputs
+
+    def flush(self) -> List[str]:
+        if self._marker_seen:
+            return []
+        if not self._buffer:
+            return []
+        emit = self._buffer
+        self._buffer = ""
+        return [emit]
 
 
 def mask_headers(headers: Dict[str, str]) -> Dict[str, str]:

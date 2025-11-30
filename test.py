@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Optional
 from PIL import Image, ImageTk
 
 from python.image_preprocessor import is_image_file, preprocess_image
-from python.network_agent import NetworkAgent
+from python.network_agent import NetworkAgent, parse_operations
 from python.file_ops import build_unified_diff, read_text_for_diff
 
 with open('api-key.txt', 'r', encoding='utf-8') as f:
@@ -56,6 +56,11 @@ REASONING_CHOICES = [
 
 
 class ChatWindow:
+    HISTORY_RENDER_MAX_CHARS = 12000
+    PREVIEW_RENDER_MAX_CHARS = 60000
+    STREAM_BUFFER_MAX_CHARS = 8000
+    STREAM_REFRESH_INTERVAL_MS = 120
+
     def __init__(self) -> None:
         self.workspace_root = Path(__file__).resolve().parent
         self._workspace_root_resolved = self.workspace_root.resolve()
@@ -225,6 +230,20 @@ class ChatWindow:
         self.read_output_box = scrolledtext.ScrolledText(read_frame, height=8, wrap=tk.NONE, state=tk.DISABLED)
         self.read_output_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
+        replay_frame = ttk.LabelFrame(self._scrollable_body, text="重放历史响应 (调试)")
+        replay_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 10))
+        replay_controls = tk.Frame(replay_frame)
+        replay_controls.pack(fill=tk.X, padx=4, pady=(2, 2))
+        tk.Label(replay_controls, text="历史文件路径:").pack(side=tk.LEFT)
+        self.replay_path_var = tk.StringVar(value="agent_data/histories/SFedAvg_GoLore_01.json")
+        self.replay_path_entry = tk.Entry(replay_controls, textvariable=self.replay_path_var)
+        self.replay_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        tk.Button(
+            replay_controls,
+            text="重放最后一条",
+            command=self.replay_history_response,
+        ).pack(side=tk.LEFT)
+
         stream_frame = ttk.LabelFrame(self._scrollable_body, text="实时流式状态")
         stream_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(4, 4))
         self.streaming_status_var = tk.StringVar(value="状态: 流式未启用")
@@ -242,6 +261,9 @@ class ChatWindow:
         self._stream_output_buffer: List[str] = []
         self._stream_rendered_text: str = ""
         self._stream_force_refresh = False
+        self._stream_output_truncated = False
+        self._stream_thinking_truncated = False
+        self._stream_refresh_job: str | None = None
         self._pending_operations: List[Dict[str, Any]] = []
         self._auto_read_active = False
         self._auto_read_counter = 0
@@ -344,6 +366,7 @@ class ChatWindow:
         if error:
             messagebox.showerror("调用失败", str(error))
             if self.streaming_var.get() and update_stream:
+                self._cancel_stream_refresh()
                 self.streaming_status_var.set("状态: 调用失败")
                 if not (self._stream_output_buffer or self._stream_thinking_buffer):
                     self._set_text(self.stream_live_box, f"(错误详情) {error}")
@@ -351,6 +374,7 @@ class ChatWindow:
             self._update_operations_preview([])
         else:
             if self.streaming_var.get() and update_stream:
+                self._cancel_stream_refresh()
                 self.streaming_status_var.set("状态: 完成")
                 self._update_stream_box()
             write_ops = [op for op in operations or [] if (op.get("action") == "writeFile")]
@@ -370,7 +394,12 @@ class ChatWindow:
         tag = "user" if role == "user" else "assistant"
         prefix = "我" if role == "user" else "助手"
         self.history.insert(tk.END, f"[{prefix}]\n", tag)
-        self.history.insert(tk.END, content + "\n\n")
+        display_content = self._limit_for_display(
+            content,
+            limit=self.HISTORY_RENDER_MAX_CHARS,
+            label=f"{prefix}消息",
+        )
+        self.history.insert(tk.END, display_content + "\n\n")
         self.history.tag_config("user", foreground="#82d3ff")
         self.history.tag_config("assistant", foreground="#f6d365")
         self.history.config(state=tk.DISABLED)
@@ -392,16 +421,16 @@ class ChatWindow:
             self._set_text(self.request_preview, f"(预览失败: {exc})")
             return
         pretty = json.dumps(preview, ensure_ascii=False, indent=2)
-        self._set_text(self.request_preview, pretty)
+        self._set_text(self.request_preview, self._limited_preview_text(pretty, "请求预览"))
 
     def refresh_response_preview(self) -> None:
         preview = self.agent.last_preview
-        self._set_text(
-            self.response_preview,
-            json.dumps(preview.get("response", {}), ensure_ascii=False, indent=2)
-            if preview.get("response")
-            else "(暂无响应记录)",
-        )
+        if preview.get("response"):
+            pretty = json.dumps(preview.get("response", {}), ensure_ascii=False, indent=2)
+            text = self._limited_preview_text(pretty, "响应预览")
+        else:
+            text = "(暂无响应记录)"
+        self._set_text(self.response_preview, text)
 
     def _set_text(
         self,
@@ -423,6 +452,16 @@ class ChatWindow:
             widget.yview_moveto(0.0)
         widget.config(state=previous_state)
 
+    def _limit_for_display(self, text: str, *, limit: int, label: str) -> str:
+        if not text or len(text) <= limit:
+            return text or ""
+        omitted = len(text) - limit
+        truncated = text[:limit].rstrip()
+        return f"{truncated}\n\n(仅显示前 {limit} 字符；已省略 {omitted} 字符的{label})"
+
+    def _limited_preview_text(self, text: str, label: str) -> str:
+        return self._limit_for_display(text, limit=self.PREVIEW_RENDER_MAX_CHARS, label=label)
+
     def _insert_text(
         self,
         widget: scrolledtext.ScrolledText,
@@ -440,6 +479,56 @@ class ChatWindow:
         else:
             widget.see(anchor_index)
         widget.config(state=previous_state)
+
+    def _append_stream_text(
+        self,
+        buffer: List[str],
+        text: str,
+        *,
+        kind: str,
+        prefer_head: bool = False,
+    ) -> None:
+        if not text:
+            return
+        buffer.append(text)
+        total = sum(len(chunk) for chunk in buffer)
+        if total <= self.STREAM_BUFFER_MAX_CHARS:
+            return
+        if prefer_head:
+            combined = "".join(buffer)
+            buffer.clear()
+            buffer.append(combined[: self.STREAM_BUFFER_MAX_CHARS])
+        else:
+            overflow = total - self.STREAM_BUFFER_MAX_CHARS
+            while buffer and overflow > 0:
+                head = buffer[0]
+                if len(head) <= overflow:
+                    overflow -= len(head)
+                    buffer.pop(0)
+                else:
+                    buffer[0] = head[overflow:]
+                    overflow = 0
+        if kind == "output":
+            self._stream_output_truncated = True
+        else:
+            self._stream_thinking_truncated = True
+
+    def _schedule_stream_refresh(self, *, force: bool = False) -> None:
+        if force:
+            self._stream_force_refresh = True
+        if self._stream_refresh_job is not None:
+            return
+        self._stream_refresh_job = self.root.after(self.STREAM_REFRESH_INTERVAL_MS, self._flush_stream_refresh)
+
+    def _flush_stream_refresh(self) -> None:
+        self._stream_refresh_job = None
+        self._update_stream_box()
+
+    def _cancel_stream_refresh(self) -> None:
+        if self._stream_refresh_job is None:
+            return
+        self.root.after_cancel(self._stream_refresh_job)
+        self._stream_refresh_job = None
 
     def _is_widget_near_bottom(self, widget: scrolledtext.ScrolledText, threshold: float = 0.985) -> bool:
         if not widget:
@@ -589,10 +678,13 @@ class ChatWindow:
         self.schedule_request_preview()
 
     def _reset_stream_display(self) -> None:
+        self._cancel_stream_refresh()
         self._stream_thinking_buffer.clear()
         self._stream_output_buffer.clear()
         self._stream_rendered_text = ""
         self._stream_force_refresh = False
+        self._stream_output_truncated = False
+        self._stream_thinking_truncated = False
         placeholder = "(启用流式响应以查看实时内容)"
         if not hasattr(self, "stream_live_box"):
             return
@@ -615,26 +707,42 @@ class ChatWindow:
         if not self.streaming_var.get():
             return
         etype = event.get("type")
+        schedule_refresh = False
+        force_refresh = False
         if etype == "thinking":
             text = event.get("text")
             if text:
-                self._stream_thinking_buffer.append(text)
+                self._append_stream_text(self._stream_thinking_buffer, text, kind="thinking")
+                schedule_refresh = True
         elif etype == "text":
             text = event.get("text")
             if text:
-                self._stream_output_buffer.append(text)
+                self._append_stream_text(self._stream_output_buffer, text, kind="output")
+                schedule_refresh = True
         elif etype == "status":
             status = event.get("status") or "(未知状态)"
             self.streaming_status_var.set(f"状态: {status}")
         elif etype == "complete":
             self.streaming_status_var.set("状态: 完成")
+            schedule_refresh = True
         elif etype == "final_text":
             text = event.get("text") or ""
             self._stream_thinking_buffer.clear()
-            self._stream_output_buffer = [text] if text else []
+            self._stream_output_buffer.clear()
+            self._stream_output_truncated = False
+            self._stream_thinking_truncated = False
+            if text:
+                self._append_stream_text(
+                    self._stream_output_buffer,
+                    text,
+                    kind="output",
+                    prefer_head=True,
+                )
             self._stream_rendered_text = ""
-            self._stream_force_refresh = True
-        self._update_stream_box()
+            force_refresh = True
+            schedule_refresh = True
+        if schedule_refresh:
+            self._schedule_stream_refresh(force=force_refresh)
 
     def _update_stream_box(self) -> None:
         if not hasattr(self, "stream_live_box"):
@@ -654,6 +762,13 @@ class ChatWindow:
             sections.append("【思考】\n" + "".join(self._stream_thinking_buffer).strip())
         if self._stream_output_buffer:
             sections.append("【输出】\n" + "".join(self._stream_output_buffer))
+        notices: List[str] = []
+        if self._stream_thinking_truncated:
+            notices.append("思考内容仅保留最新片段")
+        if self._stream_output_truncated:
+            notices.append("输出内容仅保留最新片段")
+        if notices:
+            sections.append("（" + "；".join(notices) + "）")
         text = "\n\n".join(sections)
         at_bottom = self._is_widget_near_bottom(self.stream_live_box)
         previous = self._stream_rendered_text
@@ -830,6 +945,60 @@ class ChatWindow:
         display = content if len(content) <= limit else content[:limit] + "\n...(已截断)"
         header = f"路径: {rel}\n大小: {target.stat().st_size} bytes\n---\n"
         self._set_text(self.read_output_box, header + display, follow_tail=False)
+
+    def replay_history_response(self) -> None:
+        raw_path = (self.replay_path_var.get() or "").strip()
+        if not raw_path:
+            messagebox.showinfo("重放历史", "请提供历史 JSON 路径。")
+            return
+        if os.path.isabs(raw_path):
+            file_path = Path(raw_path)
+        else:
+            file_path = (self.workspace_root / raw_path).resolve()
+        if not file_path.exists():
+            messagebox.showerror("重放历史", f"文件不存在: {file_path}")
+            return
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("重放历史", f"读取历史失败: {exc}")
+            return
+        last_entry = None
+        for entry in reversed(data):
+            if entry.get("role") == "assistant":
+                last_entry = entry
+                break
+        if not last_entry:
+            messagebox.showinfo("重放历史", "未找到助手回复。")
+            return
+        reply_text = self._history_content_to_text(last_entry.get("content"))
+        if reply_text is None:
+            messagebox.showerror("重放历史", "无法解析助手内容。")
+            return
+        operations = last_entry.get("operations") or parse_operations(reply_text)
+        self._process_agent_response(
+            reply_text,
+            None,
+            operations,
+            suppress_spinner=True,
+            update_stream=False,
+        )
+        messagebox.showinfo("重放历史", "已重放最新的助手响应。")
+
+    def _history_content_to_text(self, content: Any) -> Optional[str]:
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            pieces: List[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if text:
+                        pieces.append(str(text))
+            return "\n".join(pieces) if pieces else None
+        return str(content)
 
     def apply_pending_operations(self) -> None:
         if not self._pending_operations:

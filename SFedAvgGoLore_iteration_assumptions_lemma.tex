@@ -1,0 +1,185 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{bbm}
+
+% Macros
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\ip}[2]{\left\langle #1,\, #2 \right\rangle}
+\newcommand{\St}{\mathrm{St}}
+\newcommand{\grad}{\nabla}
+\newcommand{\one}{\mathbbm{1}}
+
+\newtheorem{assumption}{Assumption}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+
+\title{SFedAvg-GoLore: Iteration Format, Assumptions, and First Lemma with Step-by-Step Proof}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Algorithmic Iteration Format}
+We consider a nonconvex federated learning problem with $m$ clients. The global objective is
+\[
+  \min_{\theta\in\R^d} f(\theta) := \frac{1}{m}\sum_{i=1}^m F_i(\theta), \quad F_i(\theta):=\E_{\xi\sim D_i}\big[F_i(\theta;\xi)\big].
+\]
+Each communication round $t\in\{0,1,\dots,T-1\}$ proceeds as follows.
+
+\subsection{Server-side: Subspace Sampling, Client Sampling, Aggregation}
+\begin{algorithm}[h!]
+\caption{SFedAvg-GoLore (server-side)}
+\label{alg:server}
+\begin{algorithmic}[1]
+\State \textbf{Input:} total rounds $T$, local steps per round $K$, client fraction $C$, local stepsize $\eta$, momentum $\mu$, batch size $B$, subspace rank $r$.
+\State \textbf{Initialize:} global model $\theta^{0}\in\R^d$.
+\For{$t=0,1,\dots,T-1$}
+  \State Sample a one-sided random subspace: draw $P_t\in\St(d,r)$ uniformly; set $\Pi_t := P_t P_t^\top$ (held fixed within round $t$).
+  \State Sample a client subset $S_t\subseteq[m]$ with $|S_t|=n\approx C m$ using uniform sampling (with or without replacement).
+  \ForAll{$i\in S_t$ \textbf{in parallel}}
+     \State Send $(\theta^t, \Pi_t)$ to client $i$.
+     \State Receive local model delta $\Delta_i^t$ returned by client $i$ via Algorithm~\ref{alg:client}.
+  \EndFor
+  \State \textbf{Aggregation:} $\theta^{t+1} \gets \theta^t + \frac{1}{|S_t|}\sum_{i\in S_t} \Delta_i^t$.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Client-side: Projected Momentum and Local SGD}
+\begin{algorithm}[h!]
+\caption{ClientUpdate$(i;\theta^t,\Pi_t,K,\eta,\mu,B)$ with Momentum Projection (MP)}
+\label{alg:client}
+\begin{algorithmic}[1]
+\State \textbf{Input:} server model $\theta^t$, projector $\Pi_t$, local steps $K$, stepsize $\eta$, momentum $\mu\in[0,1)$, batch size $B$.
+\State \textbf{Momentum projection at round start:} If a momentum state $v_i^{\mathrm{prev}}$ is stored from the previous round, set $v_{i,0} \gets \Pi_t v_i^{\mathrm{prev}}$; else set $v_{i,0} \gets 0$.
+\State Set local model $\theta_{i,0} \gets \theta^t$.
+\For{$s=0,1,\dots,K-1$}
+  \State Sample a mini-batch $\xi_{i,s}$ of size $B$ and compute stochastic gradient $g_{i,s} \gets \grad F_i(\theta_{i,s};\xi_{i,s})$.
+  \State Update momentum: $v_{i,s+1} \gets \mu\, v_{i,s} + \Pi_t\, g_{i,s}$ \hfill (one-sided projected momentum)
+  \State Update local model: $\theta_{i,s+1} \gets \theta_{i,s} - \eta\, v_{i,s+1}$.
+\EndFor
+\State \textbf{Return:} $\Delta_i^t \gets \theta_{i,K} - \theta^t$, and store $v_i^{\mathrm{prev}}\gets v_{i,K}$.
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Remarks.} Within each round $t$, the projector $\Pi_t$ is fixed and only the mini-batch randomness varies across local steps. At the beginning of each round, momentum projection (MP) ensures the previous round's momentum is mapped into the current subspace, mitigating subspace-switch-induced bias.
+
+\section{Assumptions}
+We make the following standard assumptions for nonconvex stochastic optimization and federated sampling. Expectations are taken with respect to the appropriate randomness, and conditioning is used when needed (tower property). We avoid independence-related errors by explicitly stating independence when it is required.
+
+\begin{assumption}[Smoothness]\label{ass:smooth}
+Each local objective $F_i$ has $L$-Lipschitz continuous gradient: for all $x,y\in\R^d$,\ $\norm{\grad F_i(x) - \grad F_i(y)} \le L\, \norm{x-y}$.
+\end{assumption}
+
+\begin{assumption}[Unbiased stochastic gradients]\label{ass:unbiased}
+For each client $i$, the mini-batch gradient is unbiased: for all $\theta$,\ $\E_{\xi\sim D_i}[\grad F_i(\theta;\xi)] = \grad F_i(\theta)$.
+\end{assumption}
+
+\begin{assumption}[Bounded variance and heterogeneity]\label{ass:variance}
+There exist constants $\sigma_L>0$ and $\sigma_G>0$ such that for all $i$ and $\theta$,
+\begin{align*}
+\E_{\xi\sim D_i}\big[\norm{\grad F_i(\theta;\xi) - \grad F_i(\theta)}^2\big] &\le \sigma_L^2,\\
+\norm{\grad F_i(\theta) - \grad f(\theta)}^2 &\le \sigma_G^2.
+\end{align*}
+\end{assumption}
+
+\begin{assumption}[Unbiased client sampling]\label{ass:sampling}
+Let $S_t$ be the randomly selected set of participating clients at round $t$ with $|S_t|=n$. We assume uniform sampling (with or without replacement) yields an unbiased estimator of the full average, i.e.,
+\[
+\E\left[\frac{1}{|S_t|}\sum_{i\in S_t} \Delta_i^t\right] = \frac{1}{m}\sum_{i=1}^m \Delta_i^t\quad\text{(expectation over the sampling of $S_t$)}.
+\]
+No independence between $S_t$ and other randomness (e.g., mini-batches) is required for this unbiasedness; conditioning on $S_t$ suffices.
+\end{assumption}
+
+\begin{assumption}[Random subspace sampling independence]\label{ass:stiefel}
+At the beginning of each round $t$, $P_t$ is sampled uniformly from the Stiefel manifold $\St(d,r)$ and independently of the client sampling $S_t$ and all mini-batch draws within the round. Formally, conditioning on the $\sigma$-algebra generated by $S_t$ and the sequence of mini-batches, $P_t$ is independent and has distribution $U(\St(d,r))$.
+\end{assumption}
+
+\section{First Lemma and Step-by-Step Proof}
+We establish the fundamental properties of the random projector $\Pi_t = P_t P_t^\top$ with $P_t\sim U(\St(d,r))$. These properties are used to correctly account for the effect of the low-rank subspace on the descent and variance terms, while avoiding any erroneous independence assumptions.
+
+\begin{lemma}[Expectation and error of random subspace projector]\label{lem:proj}
+Let $P\sim U(\St(d,r))$ and define $\Pi := P P^\top$. Let $\delta:= r/d\in(0,1]$. Then:
+\begin{enumerate}
+  \item (Expectation of projector) $\E[\Pi] = \delta\, I_d$.
+  \item (Orthogonality decomposition) For any $A,B\in\R^d$, $\ip{\Pi A}{(I-\Pi)B} = 0$, and hence $\norm{\Pi A + (I-\Pi)B}^2 = \norm{\Pi A}^2 + \norm{(I-\Pi)B}^2$.
+  \item (Mean squared projection error, deterministic $g$) For any fixed (deterministic) $g\in\R^d$,\ $\E\big[\norm{\Pi g - g}^2\big] = (1-\delta)\, \norm{g}^2$.
+  \item (Mean squared projection error, random $g$) If $g$ is random (possibly dependent on other randomness), then by the tower property,\ $\E\big[\norm{\Pi g - g}^2\big] = \E\big[\,\E\big[\norm{\Pi g - g}^2\,\big|\,g\big]\,\big] = (1-\delta)\, \E\big[\norm{g}^2\big]$.
+\end{enumerate}
+\end{lemma}
+
+\paragraph{Proof (step-by-step).}
+We proceed carefully, using conditioning when needed and avoiding any unwarranted independence assumptions.
+
+\medskip\noindent\textbf{Step 1: Rotational invariance implies $\E[\Pi]$ is a scalar multiple of $I_d$.}
+\begin{itemize}
+  \item The distribution $U(\St(d,r))$ is left-invariant under orthogonal transformations: for any orthogonal matrix $R\in\R^{d\times d}$ (i.e., $R^\top R = I_d$), the random matrix $RP$ has the same distribution as $P$.
+  \item Consider $\E[\Pi] = \E[P P^\top]$. For any orthogonal $R$, we have
+  \[
+    R\,\E[\Pi] \,R^\top = \E[R (P P^\top) R^\top] = \E[(RP)(RP)^\top] = \E[\Pi],
+  \]
+  where the equality uses the rotational invariance of $U(\St(d,r))$.
+  \item A matrix that commutes with all orthogonal matrices must be a scalar multiple of identity (by standard representation theory or by the spectral characterization). Hence, there exists $\alpha\in\R$ such that $\E[\Pi] = \alpha I_d$.
+\end{itemize}
+
+\medskip\noindent\textbf{Step 2: Determine $\alpha$ via the trace identity.}
+\begin{itemize}
+  \item Since $P\in\St(d,r)$ has orthonormal columns, we have $P^\top P = I_r$ and $\mathrm{trace}(P P^\top) = \mathrm{trace}(P^\top P) = r$.
+  \item Taking expectation and using linearity of trace,
+  \[
+    \mathrm{trace}\big(\E[\Pi]\big) = \E\big[\mathrm{trace}(\Pi)\big] = \E[r] = r.
+  \]
+  \item On the other hand, $\mathrm{trace}(\E[\Pi]) = \mathrm{trace}(\alpha I_d) = \alpha d$. Therefore, $\alpha d = r \Rightarrow \alpha = r/d =: \delta$.
+  \item Conclude: $\E[\Pi] = \delta\, I_d$.
+\end{itemize}
+
+\medskip\noindent\textbf{Step 3: Orthogonality decomposition (claim 2).}
+\begin{itemize}
+  \item For any fixed $P$, $\Pi := P P^\top$ is an orthogonal projector onto the column space of $P$. Hence $\Pi^2 = \Pi$ and $(I-\Pi)^2 = I-\Pi$ with $\Pi(I-\Pi) = 0$.
+  \item For any $A,B\in\R^d$,\ $\ip{\Pi A}{(I-\Pi)B} = A^\top \Pi (I-\Pi) B = A^\top 0\, B = 0$.
+  \item Therefore, $\norm{\Pi A + (I-\Pi)B}^2 = \norm{\Pi A}^2 + \norm{(I-\Pi)B}^2$, since the cross term vanishes.
+\end{itemize}
+
+\medskip\noindent\textbf{Step 4: Mean squared projection error for deterministic $g$ (claim 3).}
+\begin{itemize}
+  \item Fix a deterministic $g\in\R^d$. Using the projector identity $(I-\Pi)^2 = I-\Pi$, we get
+  \[
+    \norm{\Pi g - g}^2 = \norm{(I-\Pi) g}^2 = g^\top (I-\Pi)^2 g = g^\top (I-\Pi) g.
+  \]
+  \item Taking expectation with respect to the randomness of $P$ (i.e., $\Pi$), and using linearity of expectation,
+  \[
+    \E\big[\norm{\Pi g - g}^2\big] = \E\big[g^\top (I-\Pi) g\big] = g^\top (I - \E[\Pi]) g.
+  \]
+  \item From Step 2, $\E[\Pi] = \delta I_d$. Therefore,
+  \[
+    \E\big[\norm{\Pi g - g}^2\big] = g^\top (I - \delta I) g = (1-\delta)\, \norm{g}^2.
+  \]
+\end{itemize}
+
+\medskip\noindent\textbf{Step 5: Mean squared projection error for random $g$ (claim 4).}
+\begin{itemize}
+  \item Let $g$ be any random vector (possibly dependent on other randomness). We do not assume independence between $g$ and $P$; instead we use the tower property (law of total expectation).
+  \item Condition on $g$ (treated as fixed within the inner expectation). By Step 4,
+  \[
+    \E\big[\norm{\Pi g - g}^2\,\big|\,g\big] = (1-\delta)\, \norm{g}^2.
+  \]
+  \item Taking the outer expectation with respect to the randomness of $g$ (and any other sources),
+  \[
+    \E\big[\norm{\Pi g - g}^2\big] = \E\Big[\,\E\big[\norm{\Pi g - g}^2\,\big|\,g\big] \Big] = (1-\delta)\, \E\big[\norm{g}^2\big].
+  \]
+\end{itemize}
+\qed
+
+\section{Notes on Expectation Handling}
+In subsequent analysis (not included here), whenever an expectation involves both the random projector $\Pi_t$ and other sources of randomness (e.g., client sampling $S_t$ or mini-batches), we systematically apply conditioning (tower property) to avoid any independence errors. Assumption~\ref{ass:stiefel} ensures $P_t$ is sampled independently at the start of the round; however, even without independence, claims like Lemma~\ref{lem:proj}(4) hold by conditioning on $g$.
+
+\end{document}
